@@ -11,6 +11,7 @@ from mcp import types as mcp_types
 from mcp.server.lowlevel import Server
 from mcp.server.sse import SseServerTransport
 from starlette.applications import Starlette
+from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 
 load_dotenv()
@@ -90,6 +91,20 @@ def _resolve_employee_id(employee_id: str = "") -> str:
             "No employee_id supplied and SAGE_INTACCT_DEFAULT_EMPLOYEE_ID is not set"
         )
     return configured
+
+
+def _find_task(project_id: str, task_key: str) -> dict[str, Any]:
+    target_project = None
+    for project in MOCK_PROJECTS:
+        if project["project_id"] == project_id:
+            target_project = project
+            break
+    if target_project is None:
+        raise ValueError(f"Unknown project_id '{project_id}'")
+    for task in target_project["tasks"]:
+        if str(task["task_key"]) == str(task_key):
+            return task
+    raise ValueError(f"Task key '{task_key}' not found on project '{project_id}'")
 
 
 def _parse_date(value: str) -> datetime.date:
@@ -192,8 +207,23 @@ async def submit_timesheet(
     if not entries:
         raise ValueError("At least one timesheet entry is required")
     resolved_employee = _resolve_employee_id(employee_id)
+    validated_entries = []
+    for entry in entries:
+        qty = float(entry["qty"])
+        if qty <= 0 or qty > 24:
+            raise ValueError(
+                f"Invalid qty {qty} for {entry.get('entry_date')}: "
+                "must be between 0 and 24"
+            )
+        new_entry = dict(entry)
+        new_entry["qty"] = qty
+        if MOCK_MODE:
+            task = _find_task(entry["project_id"], str(entry["task_key"]))
+            if "billable" not in entry:
+                new_entry["billable"] = task.get("billable", True)
+        validated_entries.append(new_entry)
     payload_xml = build_timesheet_xml(
-        resolved_employee, begin_date, entries, description
+        resolved_employee, begin_date, validated_entries, description
     )
     if not MOCK_MODE:
         return await intacct_request(payload_xml)
@@ -202,7 +232,7 @@ async def submit_timesheet(
     _mock_sequence += 1
     iso_begin = _to_iso_date(begin_date)
     record_no = f"TS-{iso_begin[:4]}-{_mock_sequence}"
-    total_hours = sum(float(e["qty"]) for e in entries)
+    total_hours = sum(float(e["qty"]) for e in validated_entries)
     stored = {
         "record_no": record_no,
         "employee_id": resolved_employee,
@@ -218,7 +248,7 @@ async def submit_timesheet(
                 "billable": bool(e.get("billable", True)),
                 "notes": e.get("notes", ""),
             }
-            for e in entries
+            for e in validated_entries
         ],
     }
     _mock_timesheets[record_no] = stored
@@ -229,7 +259,7 @@ async def submit_timesheet(
         "employee_id": resolved_employee,
         "begin_date": iso_begin,
         "total_hours": total_hours,
-        "entries_count": len(entries),
+        "entries_count": len(validated_entries),
         "submission_state": "submitted",
         "message": (
             f"Timesheet {record_no} successfully created and submitted to Sage Intacct"
@@ -426,8 +456,13 @@ async def handle_sse(request):
         await app.run(streams[0], streams[1], app.create_initialization_options())
 
 
+async def health(request):
+    return JSONResponse({"status": "ok", "mode": "mock" if MOCK_MODE else "live"})
+
+
 starlette_app = Starlette(
     routes=[
+        Route("/health", endpoint=health),
         Route("/sse", endpoint=handle_sse),
         Mount("/messages/", app=sse.handle_post_message),
     ],
